@@ -1,5 +1,9 @@
 # SSE - Server Sent Events Client/Server Library for Go
 
+## ⚠️Maintenance Status
+
+**The upstream project at `github.com/r3labs/sse/v2` seems to be unmaintained. The module name has been changed to `barney.ci/sse/v2` and the code has diverged from upstream.**
+
 ## Synopsis
 
 SSE is a client/server implementation for Server Sent Events for Golang.
