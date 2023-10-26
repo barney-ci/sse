@@ -185,7 +185,9 @@ compatibility, this project is maintained under [the Semantic Versioning guideli
 
 ## Copyright and License
 
-Code and documentation copyright since 2015 r3labs.io authors.
+Code and documentation from `github.com/r3labs/sse/v2` copyright since 2015 r3labs.io authors.
+
+Changes in this fork by other authors are the copyright of those authors or their assignees.
 
 Code released under
 [the Mozilla Public License Version 2.0](LICENSE).
