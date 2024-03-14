@@ -106,7 +106,7 @@ func (c *Client) SubscribeWithContext(ctx context.Context, stream string, handle
 		}
 
 		reader := NewEventStreamReader(resp.Body, c.maxBufferSize)
-		eventChan, errorChan := c.startReadLoop(reader)
+		eventChan, errorChan := c.startReadLoop(ctx, reader)
 
 		for {
 			select {
@@ -135,7 +135,7 @@ func (c *Client) SubscribeChanWithContext(ctx context.Context, stream string, ch
 	c.mu.Unlock()
 
 	operation := func() error {
-		resp, err := c.request(ctx, stream)
+		resp, err := c.request(subCtx, stream)
 		if err != nil {
 			return err
 		}
@@ -157,7 +157,7 @@ func (c *Client) SubscribeChanWithContext(ctx context.Context, stream string, ch
 		}
 
 		reader := NewEventStreamReader(resp.Body, c.maxBufferSize)
-		eventChan, errorChan := c.startReadLoop(reader)
+		eventChan, errorChan := c.startReadLoop(subCtx, reader)
 
 		for {
 			var msg *Event
@@ -184,7 +184,7 @@ func (c *Client) SubscribeChanWithContext(ctx context.Context, stream string, ch
 
 	go func() {
 		defer c.cleanup(ch)
-		err := c.retryNotify(ctx, operation)
+		err := c.retryNotify(subCtx, operation)
 		// channel closed once connected
 		if err != nil && !connected {
 			errch <- err
@@ -206,52 +206,73 @@ func (c *Client) retryNotify(ctx context.Context, operation func() error) error 
 	bk = backoff.WithContext(bk, ctx)
 	err := backoff.RetryNotify(operation, bk, c.ReconnectNotify)
 	if c.failedcb != nil && err != nil {
+		if ctx.Err() != nil {
+			// If the context has been canceled, which can happen when a subscription is ended, return that error
+			// instead of the last one encountered during backoff.
+			err = ctx.Err()
+		}
 		c.failedcb(c, err)
 	}
 	return err
 }
 
-func (c *Client) startReadLoop(reader *EventStreamReader) (chan *Event, chan error) {
+func (c *Client) startReadLoop(ctx context.Context, reader *EventStreamReader) (chan *Event, chan error) {
 	outCh := make(chan *Event)
 	erChan := make(chan error)
-	go c.readLoop(reader, outCh, erChan)
+	go c.readLoop(ctx, reader, outCh, erChan)
 	return outCh, erChan
 }
 
-func (c *Client) readLoop(reader *EventStreamReader, outCh chan *Event, erChan chan error) {
+func (c *Client) readLoop(ctx context.Context, reader *EventStreamReader, outCh chan *Event, erChan chan error) {
 	for {
-		// Read each new line and process the type of event
-		event, err := reader.ReadEvent()
+		msg, err := c.readLoopInner(reader)
 		if err != nil {
-			// run user specified disconnect function
-			if c.disconnectcb != nil {
-				c.Connected = false
-				c.disconnectcb(c)
+			select {
+			case <-ctx.Done():
+			case erChan <- err:
 			}
-			erChan <- err
-			return
-		}
-
-		if !c.Connected && c.connectedcb != nil {
-			c.Connected = true
-			c.connectedcb(c)
-		}
-
-		// If we get an error, ignore it.
-		var msg *Event
-		if msg, err = c.processEvent(event); err == nil {
-			if len(msg.ID) > 0 {
-				c.LastEventID.Store(msg.ID)
-			} else {
-				msg.ID, _ = c.LastEventID.Load().([]byte)
-			}
-
-			// Send downstream if the event has something useful
-			if msg.hasContent() {
-				outCh <- msg
+			break
+		} else if msg != nil {
+			select {
+			case <-ctx.Done():
+			case outCh <- msg:
 			}
 		}
 	}
+}
+
+func (c *Client) readLoopInner(reader *EventStreamReader) (*Event, error) {
+	// Read each new line and process the type of event
+	event, err := reader.ReadEvent()
+	if err != nil {
+		// run user specified disconnect function
+		if c.disconnectcb != nil {
+			c.Connected = false
+			c.disconnectcb(c)
+		}
+		return nil, err
+	}
+
+	if !c.Connected && c.connectedcb != nil {
+		c.Connected = true
+		c.connectedcb(c)
+	}
+
+	// If we get an error, ignore it.
+	if msg, err := c.processEvent(event); err == nil {
+		if len(msg.ID) > 0 {
+			c.LastEventID.Store(msg.ID)
+		} else {
+			msg.ID, _ = c.LastEventID.Load().([]byte)
+		}
+
+		// Send downstream only if the event has something useful
+		if msg.hasContent() {
+			return msg, nil
+		}
+	}
+
+	return nil, nil
 }
 
 // SubscribeRaw to an sse endpoint
