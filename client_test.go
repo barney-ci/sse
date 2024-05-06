@@ -5,9 +5,11 @@
 package sse
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
@@ -447,4 +449,72 @@ func TestSubscribeWithContextAbortRetrier(t *testing.T) {
 	})
 	require.Error(t, err)
 	assert.Regexp(t, `could not connect to stream: `+http.StatusText(status), err.Error())
+}
+
+func subscribeChanWithContextUnsubscribeRace(ch chan error) {
+	srv := New()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/events", srv.ServeHTTP)
+	server := httptest.NewServer(mux)
+	urlPath := server.URL + "/events"
+	srv.CreateStream("test")
+	defer srv.Close()
+
+	//Timeout for finding deadlock
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancel()
+	c := NewClient(urlPath)
+
+	eventChan := make(chan *Event)
+	err := c.SubscribeChanWithContext(ctx, "test", eventChan)
+	if err != nil {
+		ch <- err
+		return
+	}
+
+	//Simulate some messages, server automatically will close the stream
+	//after it has gone through the buffer
+	srv.Publish("test", &Event{Event: []byte("data"), Data: []byte("I've seen things you people wouldn't believe.")})
+	srv.Publish("test", &Event{Event: []byte("data"), Data: []byte("Attack ships on fire off the shoulder of Orion.")})
+	srv.Publish("test", &Event{Event: []byte("data"), Data: []byte("I watched C-beams glitter in the dark near the Tannhäuser Gate.")})
+	srv.Publish("test", &Event{Event: []byte("data"), Data: []byte("All those moments will be lost in time, like tears in rain.")})
+	srv.Publish("test", &Event{Event: []byte("finished"), Data: []byte(" ")})
+
+loop:
+	for {
+		select {
+		case ev, ok := <-eventChan:
+			if !ok {
+				srv.Close()
+				break loop
+			}
+			if bytes.Equal(ev.Event, []byte("finished")) {
+				srv.Close()
+				break loop
+			}
+		case <-ctx.Done():
+			ch <- fmt.Errorf("test deadline exceeded")
+			return
+		}
+	}
+	//Empirically set sleep to cause race condition
+	time.Sleep(time.Microsecond * 10)
+	c.Unsubscribe(eventChan)
+	ch <- nil
+}
+
+func TestSubscribeChanWithContextUnsubscribeRace(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		ch := make(chan error, 1)
+		go subscribeChanWithContextUnsubscribeRace(ch)
+		select {
+		case err := <-ch:
+			if !assert.NoError(t, err) {
+				return
+			}
+		case <-time.After(time.Second * 2):
+			assert.Fail(t, "Should return in time, possible deadlock")
+			return
+		}
+	}
 }
