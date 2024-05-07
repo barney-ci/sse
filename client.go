@@ -44,7 +44,7 @@ type Client struct {
 	ReconnectStrategy backoff.BackOff
 	disconnectcb      ConnCallback
 	connectedcb       ConnCallback
-	subscribed        map[chan *Event]chan struct{}
+	subCancels        map[chan *Event]context.CancelFunc
 	Headers           map[string]string
 	ReconnectNotify   backoff.Notify
 	ResponseValidator ResponseValidator
@@ -63,7 +63,7 @@ func NewClient(url string, opts ...func(c *Client)) *Client {
 		URL:           url,
 		Connection:    &http.Client{},
 		Headers:       make(map[string]string),
-		subscribed:    make(map[chan *Event]chan struct{}),
+		subCancels:    make(map[chan *Event]context.CancelFunc),
 		maxBufferSize: 1 << 16,
 	}
 
@@ -120,12 +120,14 @@ func (c *Client) SubscribeChan(stream string, ch chan *Event) error {
 // SubscribeChanWithContext sends all events to the provided channel with context
 func (c *Client) SubscribeChanWithContext(ctx context.Context, stream string, ch chan *Event) error {
 	var connected bool
+	subCtx, cancelFunc := context.WithCancel(ctx)
 	errch := make(chan error)
 	c.mu.Lock()
-	c.subscribed[ch] = make(chan struct{})
+	c.subCancels[ch] = cancelFunc
 	c.mu.Unlock()
 
 	operation := func() error {
+
 		resp, err := c.request(ctx, stream)
 		if err != nil {
 			return err
@@ -154,17 +156,17 @@ func (c *Client) SubscribeChanWithContext(ctx context.Context, stream string, ch
 			var msg *Event
 			// Wait for message to arrive or exit
 			select {
-			case <-c.subscribed[ch]:
-				return nil
+			case msg = <-eventChan:
 			case err = <-errorChan:
 				return err
-			case msg = <-eventChan:
+			case <-subCtx.Done():
+				return nil
 			}
 
 			// Wait for message to be sent or exit
 			if msg != nil {
 				select {
-				case <-c.subscribed[ch]:
+				case <-subCtx.Done():
 					return nil
 				case ch <- msg:
 					// message sent
@@ -269,9 +271,8 @@ func (c *Client) SubscribeChanRawWithContext(ctx context.Context, ch chan *Event
 func (c *Client) Unsubscribe(ch chan *Event) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	if c.subscribed[ch] != nil {
-		c.subscribed[ch] <- struct{}{}
+	if cancelFunc := c.subCancels[ch]; cancelFunc != nil {
+		cancelFunc()
 	}
 }
 
@@ -363,9 +364,10 @@ func (c *Client) cleanup(ch chan *Event) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.subscribed[ch] != nil {
-		close(c.subscribed[ch])
-		delete(c.subscribed, ch)
+	cancelFunc := c.subCancels[ch]
+	if cancelFunc != nil {
+		cancelFunc()
+		delete(c.subCancels, ch)
 	}
 }
 
