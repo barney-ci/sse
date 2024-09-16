@@ -22,9 +22,11 @@ import (
 	"gopkg.in/cenkalti/backoff.v1"
 )
 
-var urlPath string
-var srv *Server
-var server *httptest.Server
+var (
+	urlPath string
+	srv     *Server
+	server  *httptest.Server
+)
 
 var mldata = `{
 	"key": "value",
@@ -260,6 +262,63 @@ func TestClientChanReconnect(t *testing.T) {
 	c.Unsubscribe(events)
 }
 
+func TestClientOnFailure(t *testing.T) {
+	setup(false)
+	defer cleanup()
+
+	c := NewClient(urlPath)
+	c.ReconnectStrategy = &backoff.StopBackOff{}
+
+	called := make(chan struct{})
+	c.OnFailure(func(client *Client, err error) {
+		called <- struct{}{}
+	})
+
+	go c.Subscribe("test", func(msg *Event) {})
+
+	time.Sleep(time.Second)
+	server.CloseClientConnections()
+
+	assert.Equal(t, struct{}{}, <-called)
+}
+
+func TestClientOnFailureWithRetries(t *testing.T) {
+	setup(false)
+	defer cleanup()
+
+	c := NewClient(urlPath)
+	c.Connection.Timeout = time.Millisecond
+	b := backoff.NewExponentialBackOff()
+	// 1+2+4+8+16 = 31 => 5 retries
+	b.RandomizationFactor = 0
+	b.Multiplier = 2
+	b.MaxElapsedTime = 31 * time.Millisecond
+	b.InitialInterval = time.Millisecond
+	c.ReconnectStrategy = b
+
+	// make place for 6 calls. We should only receive 1 call here but we are
+	// making place for 6 to check if we are not calling OnFailure multiple
+	// times here. (5 retries +  1 failure call = 6 eventual failure calls)
+	called := make(chan struct{}, 6)
+	c.OnFailure(func(client *Client, err error) {
+		called <- struct{}{}
+	})
+	c.ReconnectNotify = func(err error, d time.Duration) {
+		t.Log(err)
+	}
+	c.OnDisconnect(func(client *Client) {
+		t.Log("disconnected")
+	})
+
+	go c.Subscribe("test", func(msg *Event) {})
+
+	server.CloseClientConnections()
+	time.Sleep(time.Second)
+
+	// Only 1 failure call is allowed
+	assert.Len(t, called, 1)
+}
+
 func TestClientUnsubscribe(t *testing.T) {
 	setup(false)
 	defer cleanup()
@@ -293,7 +352,7 @@ func TestClientUnsubscribeNonBlock(t *testing.T) {
 		assert.Nil(t, merr)
 		assert.Equal(t, []byte(`ping`), msg)
 	}
-	//No more data is available to be read in the channel
+	// No more data is available to be read in the channel
 	// Make sure Unsubscribe returns quickly
 	doneCh := make(chan *Event)
 	go func() {
@@ -408,7 +467,7 @@ func TestSubscribeWithContextDone(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	var n1 = runtime.NumGoroutine()
+	n1 := runtime.NumGoroutine()
 
 	c := NewClient(urlPath)
 
@@ -420,7 +479,7 @@ func TestSubscribeWithContextDone(t *testing.T) {
 	cancel()
 
 	time.Sleep(1 * time.Second)
-	var n2 = runtime.NumGoroutine()
+	n2 := runtime.NumGoroutine()
 
 	assert.Equal(t, n1, n2)
 }
@@ -460,7 +519,7 @@ func subscribeChanWithContextUnsubscribeRace(ch chan error) {
 	srv.CreateStream("test")
 	defer srv.Close()
 
-	//Timeout for finding deadlock
+	// Timeout for finding deadlock
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 	defer cancel()
 	c := NewClient(urlPath)
@@ -472,8 +531,8 @@ func subscribeChanWithContextUnsubscribeRace(ch chan error) {
 		return
 	}
 
-	//Simulate some messages, server automatically will close the stream
-	//after it has gone through the buffer
+	// Simulate some messages, server automatically will close the stream
+	// after it has gone through the buffer
 	srv.Publish("test", &Event{Event: []byte("data"), Data: []byte("I've seen things you people wouldn't believe.")})
 	srv.Publish("test", &Event{Event: []byte("data"), Data: []byte("Attack ships on fire off the shoulder of Orion.")})
 	srv.Publish("test", &Event{Event: []byte("data"), Data: []byte("I watched C-beams glitter in the dark near the Tannhäuser Gate.")})
@@ -497,7 +556,7 @@ loop:
 			return
 		}
 	}
-	//Empirically set sleep to cause race condition
+	// Empirically set sleep to cause race condition
 	time.Sleep(time.Microsecond * 10)
 	c.Unsubscribe(eventChan)
 	ch <- nil
@@ -517,4 +576,7 @@ func TestSubscribeChanWithContextUnsubscribeRace(t *testing.T) {
 			return
 		}
 	}
+}
+
+func TestSubscribeDisconnection(t *testing.T) {
 }
