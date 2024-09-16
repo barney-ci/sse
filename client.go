@@ -35,6 +35,9 @@ func ClientMaxBufferSize(s int) func(c *Client) {
 // ConnCallback defines a function to be called on a particular connection event
 type ConnCallback func(c *Client)
 
+// FailureCallback defines a function to be called on client failure (after retries)
+type FailureCallback func(c *Client, err error)
+
 // ResponseValidator validates a response
 type ResponseValidator func(c *Client, resp *http.Response) error
 
@@ -44,6 +47,7 @@ type Client struct {
 	ReconnectStrategy backoff.BackOff
 	disconnectcb      ConnCallback
 	connectedcb       ConnCallback
+	failedcb          FailureCallback
 	subCancels        map[chan *Event]context.CancelFunc
 	Headers           map[string]string
 	ReconnectNotify   backoff.Notify
@@ -127,7 +131,6 @@ func (c *Client) SubscribeChanWithContext(ctx context.Context, stream string, ch
 	c.mu.Unlock()
 
 	operation := func() error {
-
 		resp, err := c.request(ctx, stream)
 		if err != nil {
 			return err
@@ -197,7 +200,11 @@ func (c *Client) retryNotify(ctx context.Context, operation func() error) error 
 		bk = backoff.NewExponentialBackOff()
 	}
 	bk = backoff.WithContext(bk, ctx)
-	return backoff.RetryNotify(operation, bk, c.ReconnectNotify)
+	err := backoff.RetryNotify(operation, bk, c.ReconnectNotify)
+	if c.failedcb != nil && err != nil {
+		c.failedcb(c, err)
+	}
+	return err
 }
 
 func (c *Client) startReadLoop(reader *EventStreamReader) (chan *Event, chan error) {
@@ -276,14 +283,25 @@ func (c *Client) Unsubscribe(ch chan *Event) {
 	}
 }
 
-// OnDisconnect specifies the function to run when the connection disconnects
+// OnDisconnect specifies the function to run when the connection disconnects.
+// The callback will be called on _any_ disconnection event, this includes
+// events caused by retries.
 func (c *Client) OnDisconnect(fn ConnCallback) {
 	c.disconnectcb = fn
 }
 
-// OnConnect specifies the function to run when the connection is successful
+// OnConnect specifies the function to run when the connection is successful.
+// The callback will be called on _any_ connection event, this includes events
+// caused by retries.
 func (c *Client) OnConnect(fn ConnCallback) {
 	c.connectedcb = fn
+}
+
+// OnFailure specifies the function to run when Retry fails, either because the
+// client has run out of retry time or when the client has received permament
+// error.
+func (c *Client) OnFailure(fn FailureCallback) {
+	c.failedcb = fn
 }
 
 func (c *Client) request(ctx context.Context, stream string) (*http.Response, error) {
