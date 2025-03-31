@@ -10,6 +10,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
@@ -317,6 +318,42 @@ func TestClientOnFailureWithRetries(t *testing.T) {
 
 	// Only 1 failure call is allowed
 	assert.Len(t, called, 1)
+}
+
+func TestClientChanReconnectOnEOF(t *testing.T) {
+	setup(false)
+	defer cleanup()
+	streamID := "test"
+
+	c := NewClient(urlPath)
+
+	var (
+		reconnectErr      error
+		reconnectDuration time.Duration
+	)
+	c.ReconnectStrategy = backoff.NewConstantBackOff(time.Millisecond * 10)
+	c.ReconnectNotify = func(err error, duration time.Duration) {
+		reconnectErr = err
+		reconnectDuration = duration
+	}
+
+	events := make(chan *Event)
+	err := c.SubscribeChan(streamID, events)
+	require.Nil(t, err)
+
+	msg, err := wait(events, time.Millisecond*100)
+	assert.NoError(t, err)
+	assert.Equal(t, []byte(`ping`), msg)
+
+	srv.RemoveStream(streamID)
+	srv.CreateStream(streamID)
+	msg, err = wait(events, time.Millisecond*100)
+	assert.NoError(t, err)
+	assert.Equal(t, io.EOF, reconnectErr)
+	assert.Equal(t, time.Millisecond*10, reconnectDuration)
+	assert.Equal(t, []byte(`ping`), msg)
+
+	c.Unsubscribe(events)
 }
 
 func TestClientUnsubscribe(t *testing.T) {
